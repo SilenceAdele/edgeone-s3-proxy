@@ -1,9 +1,10 @@
 {
   "outputDirectory": "public",
   "caches": [
-    {
-      "source": "/**",
-      "cacheTtl": 604800
-    }
+    { "source": "/*", "cacheTtl": 604800 },
+    { "source": "/:a/:b", "cacheTtl": 604800 },
+    { "source": "/:a/:b/:c", "cacheTtl": 604800 },
+    { "source": "/:a/:b/:c/:d", "cacheTtl": 604800 },
+    { "source": "/:a/:b/:c/:d/:e", "cacheTtl": 604800 }
   ]
 }
