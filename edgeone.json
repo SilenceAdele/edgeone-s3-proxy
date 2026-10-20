@@ -1,3 +1,9 @@
 {
-  "outputDirectory": "public"
+  "outputDirectory": "public",
+  "caches": [
+    {
+      "source": "/**",
+      "cacheTtl": 604800
+    }
+  ]
 }

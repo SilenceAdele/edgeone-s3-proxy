@@ -18,6 +18,7 @@ const DEFAULT_REGION = 'cn-north-1';
 const DEFAULT_UA_PREFIX = 'S3Drive';
 const DEFAULT_ALLOWED_EXT =
   '\\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|mp4|webm|pdf|json|txt|md)$';
+const DEFAULT_CACHE_TTL = 604800; // 7 days, in seconds
 
 /** EdgeOne Edge Function context (hand-written to avoid a type dependency). */
 interface FnContext {
@@ -59,6 +60,9 @@ async function handle(ctx: FnContext): Promise<Response> {
   const region = env.S3_REGION || DEFAULT_REGION;
   const uaPrefix = env.UA_PREFIX || DEFAULT_UA_PREFIX;
   const allowedExt = new RegExp(env.ALLOWED_EXT || DEFAULT_ALLOWED_EXT, 'i');
+  // Seconds to cache an object. Object keys are content-addressed (md5-based),
+  // so a long TTL is safe. Override with CACHE_TTL if you reuse human-readable keys.
+  const cacheTtl = Number(env.CACHE_TTL || DEFAULT_CACHE_TTL);
 
   const missing = (
     [
@@ -118,18 +122,30 @@ async function handle(ctx: FnContext): Promise<Response> {
     uaPrefix,
   });
 
-  const originRes = await fetch(originUrl, { method: 'GET', headers });
+  // EdgeOne's fetch accepts extra `eo` cache hints. Ignored by other runtimes.
+  const fetchInit: RequestInit & { eo?: Record<string, unknown> } = {
+    method: 'GET',
+    headers,
+    eo: {
+      cacheEverything: true,
+      cacheTtl,
+      cacheKey: originUrl,
+    },
+  };
+  const originRes = await fetch(originUrl, fetchInit);
 
   if (!originRes.ok) {
     return text(`S3 upstream ${originRes.status}`, originRes.status);
   }
 
+  // stale-while-revalidate keeps reloads instant while the cache refreshes.
+  // The validator requires SWR/SIE in key=value form.
   const out = new Response(request.method === 'HEAD' ? null : originRes.body, {
     status: originRes.status,
     headers: {
       'content-type': originRes.headers.get('content-type') || 'application/octet-stream',
       'content-length': originRes.headers.get('content-length') || '',
-      'cache-control': 'public, max-age=31536000, immutable',
+      'cache-control': `public, max-age=${cacheTtl}, s-maxage=${cacheTtl}, stale-while-revalidate=86400`,
       'access-control-allow-origin': '*',
       'x-cache': 'MISS',
     },

@@ -52,7 +52,7 @@ S3 endpoint (Path-Style)
 - **SigV4 signing** implemented with Web Crypto (`crypto.subtle`)
 - **Signs exactly** `host;x-amz-content-sha256;x-amz-date`; `User-Agent` is set as an **unsigned** header
 - **Never sets the `Host` header** — the platform derives it from the URL; Host appears only in the canonical headers used for signing
-- **Edge caching** for one year (`immutable`) via `caches.default`
+- **Three cache layers**: the EdgeOne CDN rule (`caches` in `edgeone.json`), EdgeOne's upstream cache (`eo.cacheEverything`), and the function-level `caches.default`. Default TTL is 7 days with `stale-while-revalidate=86400` so reloads feel instant.
 - **CORS open**, so any page can embed with `<img>`
 - **Extension allowlist**, so the bucket is not exposed as a general file server
 
@@ -75,6 +75,7 @@ All credentials are read **from environment variables only**. No secret is hardc
 | `S3_REGION` | no | Default `cn-north-1` |
 | `UA_PREFIX` | no | Default `S3Drive`; change it if the key is bound to a different application |
 | `ALLOWED_EXT` | no | Regex; defaults to images and other static files |
+| `CACHE_TTL` | no | Seconds to cache an object. Default `604800` (7 days). Lower it if you overwrite keys in place. |
 
 If anything is missing the function returns **500 and names the missing variables**, so you do not have to guess.
 
