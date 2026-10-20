@@ -76,8 +76,77 @@ All credentials are read **from environment variables only**. No secret is hardc
 | `UA_PREFIX` | no | Default `S3Drive`; change it if the key is bound to a different application |
 | `ALLOWED_EXT` | no | Regex; defaults to images and other static files |
 | `CACHE_TTL` | no | Seconds to cache an object. Default `604800` (7 days). Lower it if you overwrite keys in place. |
+| `BLOB_CACHE` | no | `on` (default) or `off`. Enables the Pages Blob read-through cache. |
+| `BLOB_STORE` | no | Pages Blob namespace name. Default `s3-cache`. |
+| `BLOB_LIMIT_BYTES` | no | Eviction ceiling. Default `838860800` (800 MB) — deliberately below the 1 GB free-tier cap. |
+| `BLOB_MAX_OBJECT_BYTES` | no | Objects larger than this stream through uncached. Default `5242880` (5 MB). |
+| `BLOB_MAX_ENTRIES` | no | Hard cap on cached objects. Default `2000`. |
 
 If anything is missing the function returns **500 and names the missing variables**, so you do not have to guess.
+
+## Blob read-through cache and the 1 GB ceiling
+
+EdgeOne **does not CDN-cache edge function responses**. Measured: static assets
+return `EO-Cache-Status: Cache Hit`, while function routes return no such header
+and the function runs on every request. The `caches` rules in `edgeone.json`
+only cover static files.
+
+So the proxy keeps a persistent copy in **[Pages Blob](https://pages.edgeone.ai/document/blob-storage)**:
+
+```
+request -> function -> Pages Blob
+                         |- hit   -> return immediately (no S3 call)
+                         `- miss  -> fetch S3 -> write to Blob -> return
+```
+
+### Why an index is needed
+
+The Blob SDK never reports object size — `list()` returns only `key` and
+`etag`, and `getMetadata()` has no size field. There is no way to ask
+"how much am I using?", so the proxy maintains its own manifest:
+
+```
+obj/<s3-key>   -> the bytes
+__index__      -> {"total": 12345, "entries": {"obj/a.png": {"size": 952106, "at": 1729...}}}
+```
+
+### Eviction policy
+
+The free tier is **1 GB of account-level storage**. On each write the proxy
+recomputes the total and evicts **FIFO** (oldest write first) until it is back
+under budget.
+
+- **Ceiling is 800 MB, not 1 GB.** Concurrent function instances can lose index
+  updates — the SDK exposes no atomic compare-and-swap (`onlyIfNew` is
+  documented as *not supported*, an existing key is silently overwritten). The
+  slack absorbs that drift.
+- **FIFO, not LRU.** Tracking recency would mean a write on every read, which
+  is rate-limited (`RateLimitedError`) and racy. Objects are content-addressed
+  by default, so fresh images are the ones worth keeping.
+- **Objects over 5 MB are never buffered** — they stream straight through and
+  are never written to Blob.
+- Any Blob failure degrades to a plain proxy fetch. The cache is an
+  optimisation, never a dependency.
+
+`test-blob.mjs` covers the eviction maths with exact-value assertions against a
+mock store.
+
+### Response headers
+
+| `x-cache` | Meaning |
+|---|---|
+| `HIT-BLOB` | Served from Pages Blob, no S3 call |
+| `MISS-WRITTEN` | Fetched from S3 and written to Blob |
+| `MISS-WRITE-FAILED` | Fetched from S3, Blob write failed (check quota) |
+| `MISS-TOO-BIG` | Over `BLOB_MAX_OBJECT_BYTES`, streamed uncached |
+| `MISS` | Cache unavailable (disabled, or SDK failed to load) |
+
+### Caveat
+
+EdgeOne's own docs note that Blob *"is not recommended for use as a public
+network image hosting service or CDN."* This design keeps S3 as the source of
+truth and Blob strictly as a cache behind the function, but if you push many
+gigabytes through it, watch the console's usage page.
 
 ## Local verification
 
@@ -86,6 +155,9 @@ You can verify the signing logic without deploying:
 ```bash
 # Credentials are read from ~/.config/imgup.conf (local file, never committed)
 node test.mjs <an-object-key-that-exists-in-the-bucket>
+
+# Blob cache eviction maths against a mock store (no EdgeOne needed)
+node test-blob.mjs
 ```
 
 Expected output:

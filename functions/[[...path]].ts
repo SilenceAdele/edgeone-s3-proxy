@@ -8,6 +8,10 @@
  *   Function ->  rewrite User-Agent + attach AWS SigV4 signature
  *   S3       ->  https://<S3_ENDPOINT>/<S3_BUCKET>/2026/10/abcd1234ef56.png
  *
+ * Caching: EdgeOne does NOT CDN-cache edge function responses (verified: static
+ * assets return `EO-Cache-Status: Cache Hit`, function routes return no such
+ * header). So a read-through cache is implemented on Pages Blob instead.
+ *
  * IMPORTANT: all credentials are read from environment variables only.
  * Nothing sensitive is hardcoded. Configure them in the EdgeOne Pages
  * console under Project -> Settings -> Environment Variables.
@@ -19,6 +23,17 @@ const DEFAULT_UA_PREFIX = 'S3Drive';
 const DEFAULT_ALLOWED_EXT =
   '\\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|mp4|webm|pdf|json|txt|md)$';
 const DEFAULT_CACHE_TTL = 604800; // 7 days, in seconds
+
+// Blob cache budget. The free Pages Blob tier is 1GB per *account*, and the
+// SDK reports no object sizes from list(), so we track sizes ourselves in an
+// index and evict FIFO once over budget. The limit is deliberately below 1GB
+// to absorb lost index updates under concurrent writes (the SDK exposes no
+// atomic compare-and-swap).
+const DEFAULT_BLOB_STORE = 's3-cache';
+const DEFAULT_BLOB_LIMIT = 800 * 1024 * 1024; // 800 MB
+const DEFAULT_BLOB_MAX_OBJECT = 5 * 1024 * 1024; // 5 MB
+const DEFAULT_BLOB_MAX_ENTRIES = 2000;
+const INDEX_KEY = '__index__';
 
 /** EdgeOne Edge Function context (hand-written to avoid a type dependency). */
 interface FnContext {
@@ -64,6 +79,14 @@ async function handle(ctx: FnContext): Promise<Response> {
   // so a long TTL is safe. Override with CACHE_TTL if you reuse human-readable keys.
   const cacheTtl = Number(env.CACHE_TTL || DEFAULT_CACHE_TTL);
 
+  const blobCfg = {
+    enabled: (env.BLOB_CACHE || 'on').toLowerCase() !== 'off',
+    storeName: env.BLOB_STORE || DEFAULT_BLOB_STORE,
+    limitBytes: Number(env.BLOB_LIMIT_BYTES || DEFAULT_BLOB_LIMIT),
+    maxObjectBytes: Number(env.BLOB_MAX_OBJECT_BYTES || DEFAULT_BLOB_MAX_OBJECT),
+    maxEntries: Number(env.BLOB_MAX_ENTRIES || DEFAULT_BLOB_MAX_ENTRIES),
+  };
+
   const missing = (
     [
       ['AWS_ACCESS_KEY_ID', accessKeyId],
@@ -85,7 +108,10 @@ async function handle(ctx: FnContext): Promise<Response> {
         `  S3_ENDPOINT            hostname only, no https://\n` +
         `  S3_REGION              optional, default ${DEFAULT_REGION}\n` +
         `  UA_PREFIX              optional, default ${DEFAULT_UA_PREFIX}\n` +
-        `  ALLOWED_EXT            optional, default static/image files\n`,
+        `  ALLOWED_EXT            optional, default static/image files\n` +
+        `  CACHE_TTL              optional, default ${DEFAULT_CACHE_TTL}\n` +
+        `  BLOB_CACHE             optional, on|off, default on\n` +
+        `  BLOB_LIMIT_BYTES       optional, default ${DEFAULT_BLOB_LIMIT}\n`,
       500,
     );
   }
@@ -100,17 +126,26 @@ async function handle(ctx: FnContext): Promise<Response> {
   const originUrl = `https://${host}/${bucket}/${key}`;
   const path = `/${bucket}/${key}`;
 
-  // ---- Serve from cache when possible ----
-  const cache = caches.default;
-  const cacheKey = new Request(url.toString(), { method: 'GET' });
-  const hit = await cache.match(cacheKey);
-  if (hit) {
-    const res = new Response(hit.body, hit);
-    res.headers.set('x-cache', 'HIT');
-    return res;
+  // ---- 1. Read-through cache: try Pages Blob first ----
+  let cacheStatus = 'MISS';
+  const store = blobCfg.enabled ? await getStore(blobCfg) : null;
+  if (store) {
+    const cached = await blobGet(store, key);
+    if (cached) {
+      return new Response(request.method === 'HEAD' ? null : cached.body, {
+        status: 200,
+        headers: {
+          'content-type': cached.contentType || 'application/octet-stream',
+          'content-length': String(cached.body.byteLength),
+          'cache-control': `public, max-age=${cacheTtl}, s-maxage=${cacheTtl}, stale-while-revalidate=86400`,
+          'access-control-allow-origin': '*',
+          'x-cache': 'HIT-BLOB',
+        },
+      });
+    }
   }
 
-  // ---- Fetch upstream with a SigV4-signed request ----
+  // ---- 2. Fetch upstream with a SigV4-signed request ----
   const headers = await signRequest({
     method: 'GET',
     host,
@@ -138,24 +173,183 @@ async function handle(ctx: FnContext): Promise<Response> {
     return text(`S3 upstream ${originRes.status}`, originRes.status);
   }
 
+  const contentType = originRes.headers.get('content-type') || 'application/octet-stream';
+  const declared = Number(originRes.headers.get('content-length') || '0');
+
+  // Larger than the cache ceiling: stream straight through, never buffer.
+  if (declared > blobCfg.maxObjectBytes) {
+    return new Response(request.method === 'HEAD' ? null : originRes.body, {
+      status: originRes.status,
+      headers: {
+        'content-type': contentType,
+        'content-length': originRes.headers.get('content-length') || '',
+        'cache-control': `public, max-age=${cacheTtl}, s-maxage=${cacheTtl}, stale-while-revalidate=86400`,
+        'access-control-allow-origin': '*',
+        'x-cache': 'MISS-TOO-BIG',
+      },
+    });
+  }
+
+  const buf = await originRes.arrayBuffer();
+
   // stale-while-revalidate keeps reloads instant while the cache refreshes.
   // The validator requires SWR/SIE in key=value form.
-  const out = new Response(request.method === 'HEAD' ? null : originRes.body, {
+  const out = new Response(request.method === 'HEAD' ? null : buf.slice(0), {
     status: originRes.status,
     headers: {
-      'content-type': originRes.headers.get('content-type') || 'application/octet-stream',
-      'content-length': originRes.headers.get('content-length') || '',
+      'content-type': contentType,
+      'content-length': String(buf.byteLength),
       'cache-control': `public, max-age=${cacheTtl}, s-maxage=${cacheTtl}, stale-while-revalidate=86400`,
       'access-control-allow-origin': '*',
-      'x-cache': 'MISS',
+      'x-cache': cacheStatus,
     },
   });
 
-  // Write to cache in the background so the response is not blocked.
-  if (ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, out.clone()));
-  else await cache.put(cacheKey, out.clone());
+  // ---- 3. Populate the cache in the background; never block the response ----
+  if (store && buf.byteLength > 0 && buf.byteLength <= blobCfg.maxObjectBytes) {
+    const job = blobPut(store, key, buf, contentType, blobCfg).then((r) => {
+      out.headers.set('x-cache', r ? 'MISS-WRITTEN' : 'MISS-WRITE-FAILED');
+    });
+    if (ctx.waitUntil) ctx.waitUntil(job);
+  }
 
   return out;
+}
+
+// ================= Pages Blob read-through cache =================
+// EdgeOne does not CDN-cache function responses, so we keep a persistent copy
+// in Pages Blob. The SDK's list()/getMetadata() expose no object size, hence
+// the parallel __index__ manifest that records size + write time per key.
+// Eviction is FIFO (oldest write first): updating an LRU timestamp on every
+// read would mean a write per request, which is rate-limited and racy.
+
+interface BlobCfg {
+  enabled: boolean;
+  storeName: string;
+  limitBytes: number;
+  maxObjectBytes: number;
+  maxEntries: number;
+}
+
+interface CacheIndex {
+  total: number;
+  entries: Record<string, { size: number; at: number }>;
+}
+
+let _store: any = null;
+let _storeTried = false;
+
+/** Lazy-load the SDK so a missing package degrades instead of breaking the proxy. */
+async function getStore(cfg: BlobCfg): Promise<any> {
+  if (_storeTried) return _store;
+  _storeTried = true;
+  try {
+    const mod: any = await import('@edgeone/pages-blob');
+    _store = mod.getStore(cfg.storeName);
+  } catch {
+    _store = null;
+  }
+  return _store;
+}
+
+function emptyIndex(): CacheIndex {
+  return { total: 0, entries: {} };
+}
+
+async function readIndex(store: any): Promise<CacheIndex> {
+  try {
+    const raw = await store.get(INDEX_KEY, { type: 'text' });
+    if (!raw) return emptyIndex();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || !parsed.entries) return emptyIndex();
+    return { total: Number(parsed.total) || 0, entries: parsed.entries };
+  } catch {
+    return emptyIndex();
+  }
+}
+
+async function blobGet(
+  store: any,
+  key: string,
+): Promise<{ body: ArrayBuffer; contentType: string } | null> {
+  try {
+    if (!store) return null;
+    const body = await store.get(`obj/${key}`, { type: 'arrayBuffer' });
+    if (!body) return null;
+    let contentType = 'application/octet-stream';
+    try {
+      const meta = await store.getMetadata(`obj/${key}`);
+      contentType = meta?.contentType || contentType;
+    } catch {
+      /* metadata is best-effort */
+    }
+    return { body, contentType };
+  } catch {
+    return null;
+  }
+}
+
+/** Exported for tests: FIFO eviction keeps the manifest within budget. */
+export function evictToBudget(index: CacheIndex, cfg: BlobCfg): string[] {
+  const softLimit = Math.floor(cfg.limitBytes * 0.95);
+  const removed: string[] = [];
+  // Recompute up front: a stale total (lost updates, manual edits) must not
+  // make the loop spin or under-evict.
+  index.total = Object.values(index.entries).reduce((n, e) => n + (e.size || 0), 0);
+  while (
+    (index.total > softLimit || Object.keys(index.entries).length > cfg.maxEntries) &&
+    Object.keys(index.entries).length > 0
+  ) {
+    let oldestKey = '';
+    let oldestAt = Infinity;
+    for (const [k, v] of Object.entries(index.entries)) {
+      if (v.at < oldestAt) {
+        oldestAt = v.at;
+        oldestKey = k;
+      }
+    }
+    if (!oldestKey) break;
+    // Decrement INSIDE the loop. Recomputing only after the loop left the
+    // while-condition permanently true and drained the whole cache.
+    index.total = Math.max(0, index.total - (index.entries[oldestKey].size || 0));
+    delete index.entries[oldestKey];
+    removed.push(oldestKey);
+  }
+  return removed;
+}
+
+export async function blobPut(
+  store: any,
+  key: string,
+  buf: ArrayBuffer,
+  contentType: string,
+  cfg: BlobCfg,
+): Promise<boolean> {
+  try {
+    if (!store) return false;
+
+    const blobKey = `obj/${key}`;
+    await store.set(blobKey, buf, { cacheControl: 'public, max-age=31536000' });
+
+    const index = await readIndex(store);
+    index.entries[blobKey] = { size: buf.byteLength, at: Date.now() };
+    // Recompute the total rather than trusting the stored value: concurrent
+    // writers can lose index updates, and a recomputed total self-heals.
+    index.total = Object.values(index.entries).reduce((n, e) => n + (e.size || 0), 0);
+
+    for (const k of evictToBudget(index, cfg)) {
+      try {
+        await store.delete(k);
+      } catch {
+        /* already gone */
+      }
+    }
+
+    await store.setJSON(INDEX_KEY, index);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ================= AWS Signature V4 =================
@@ -212,7 +406,7 @@ async function signRequest(opts: {
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ''); // 20261020T120000Z
   const dateStamp = amzDate.slice(0, 8);
 
-  const payloadHash = await sha256Hex(''); // empty body for GET
+  const payloadHash = await sha256Hex(''); // GET empty body
 
   const canonicalHeaders =
     [`host:${host}`, `x-amz-content-sha256:${payloadHash}`, `x-amz-date:${amzDate}`].join('\n') +

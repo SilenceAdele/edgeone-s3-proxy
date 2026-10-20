@@ -1,0 +1,14 @@
+{
+  "name": "edgeone-s3-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "S3 reverse proxy for EdgeOne Pages Edge Functions with a Pages Blob read-through cache",
+  "license": "MIT",
+  "dependencies": {
+    "@edgeone/pages-blob": "^0.0.18"
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}
