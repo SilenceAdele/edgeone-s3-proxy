@@ -8,8 +8,6 @@ Lets a browser load objects from an S3-compatible store that rejects anonymous a
 ![image](https://img.example.com/2026/10/abcd1234ef56.png)
 ```
 
-> Cloudflare Workers edition: [`cstcloud-s3-proxy`](https://github.com/SilenceAdele/cstcloud-s3-proxy).
-
 ---
 
 ## Background: a counter-intuitive gateway rule
@@ -51,7 +49,7 @@ S3 endpoint (Path-Style)
    ↓  GET https://<S3_ENDPOINT>/<S3_BUCKET>/2026/10/xxx.png
 ```
 
-- **SigV4 signing** implemented with Web Crypto (`crypto.subtle`, available on both EdgeOne and Cloudflare)
+- **SigV4 signing** implemented with Web Crypto (`crypto.subtle`)
 - **Signs exactly** `host;x-amz-content-sha256;x-amz-date`; `User-Agent` is set as an **unsigned** header
 - **Never sets the `Host` header** — the platform derives it from the URL; Host appears only in the canonical headers used for signing
 - **Edge caching** for one year (`immutable`) via `caches.default`
