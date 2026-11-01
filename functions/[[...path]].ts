@@ -143,12 +143,13 @@ async function handle(ctx: FnContext): Promise<Response> {
   // ---- Access control on objects (Referer allowlist + token for direct opens) ----
   // Runs before Blob/S3 so a rejected request costs nothing upstream. An empty
   // allowlist disables the whole check, so an unconfigured deployment never
-  // blocks anything.
+  // blocks anything. Both rejections share one body: the status code is enough
+  // for a legitimate client, and the text should not explain the rule.
   if (refererWhitelist.length) {
     const decision = refererDecision(request, refererWhitelist);
-    if (decision === 'block') return deny('Hotlinking is not allowed', 403);
+    if (decision === 'block') return deny('Forbidden access', 403);
     if (decision === 'direct' && !(await objectTokenValid(ctx, url))) {
-      return deny('Token required', 401);
+      return deny('Forbidden access', 401);
     }
   }
 

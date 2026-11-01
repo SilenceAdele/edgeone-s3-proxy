@@ -122,8 +122,8 @@ IMG_REFERER_WHITELIST=blog.example.com,localhost:5173,127.0.0.1:5173
 | Request | Result |
 |---|---|
 | `Referer` host is in the list | served — the blog, and nothing else, can embed |
-| `Referer` host is anything else | `403 Hotlinking is not allowed`, even with a token |
-| No `Referer` (address bar, `curl`, RSS reader) | needs `PROXY_TOKEN`; otherwise `401 Token required` |
+| `Referer` host is anything else | `403 Forbidden access`, even with a token |
+| No `Referer` (address bar, `curl`, RSS reader) | needs `PROXY_TOKEN`; otherwise `401 Forbidden access` |
 | Malformed `Referer` | treated as a direct open, so it needs the token too |
 | `IMG_REFERER_WHITELIST` empty | feature off — every request is served |
 
@@ -151,6 +151,9 @@ different hosts and both need an entry if both are live; a service that merely
 sits behind the blog (an API, a comment backend) does not, because the `Referer`
 of an embedded widget is still the blog's host.
 
+- **Rejections stay vague.** Both refuse with the body `Forbidden access` and
+  `cache-control: no-store`; only the status (`401` vs `403`) says which rule fired,
+  so a stranger learns nothing about the mechanism from the response text.
 - **Hostnames only**, optionally with a port (`localhost:5173`). A pasted
   `https://` prefix or trailing path is stripped, so both forms work.
 - **Matched exactly.** No wildcards and no subdomain matching, and the port is

@@ -159,16 +159,21 @@ const guardCall = (path, referer, { whitelist = 'blog.example.com', token = 'obj
     waitUntil: () => {},
   });
 
+// Both rejections answer with the same generic body.
+const generic = async (res) => (await res.text()) === 'Forbidden access';
+
 const blocked = await guardCall('/no/such/file.png', 'https://evil.example.com/');
-pass = show('12. other sites blocked before S3 lookup', blocked, 403) && pass;
+const blockedBody = await generic(blocked);
+pass = show('12. other sites blocked before S3 lookup', blocked, 403) && blockedBody && pass;
 
 const sameSite = await guardCall('/no/such/file.png', 'https://blog.example.com/post');
 pass = show('13. whitelisted Referer reaches upstream', sameSite, 404) && pass;
 
 const directNoToken = await guardCall('/no/such/file.png', null);
+const directNoTokenBody = await generic(directNoToken);
 pass =
   show('14. direct open without token -> 401', directNoToken, 401) &&
-  (await directNoToken.text()).includes('Token required') &&
+  directNoTokenBody &&
   directNoToken.headers.get('cache-control') === 'no-store' &&
   pass;
 
@@ -176,7 +181,9 @@ const directWrong = await guardCall('/no/such/file.png?token=wrong', null);
 const wrongBody = await directWrong.text();
 pass =
   show('15. wrong token refused, never echoed', directWrong, 401) &&
+  wrongBody === 'Forbidden access' &&
   !wrongBody.includes('wrong') &&
+  !/token/i.test(wrongBody) &&
   pass;
 
 const directRight = await guardCall('/no/such/file.png?token=obj-secret', null);
