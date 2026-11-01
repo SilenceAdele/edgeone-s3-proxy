@@ -212,9 +212,10 @@ const healthHotlink = await guardCall('/health', null, {
 });
 const healthText = await healthHotlink.text();
 pass =
-  show('21. health echoes the active whitelist', healthHotlink, 200) &&
-  healthText.includes('hotlink: blog.example.com,www.example.com') &&
+  show('21. health reports the whitelist as a count', healthHotlink, 200) &&
+  healthText.includes('hotlink: on (2 hosts)') &&
   healthText.includes('direct: token') &&
+  !healthText.includes('example.com') &&
   pass;
 
 const healthOff = await guardCall('/health', null, { whitelist: '' });
@@ -253,6 +254,26 @@ const rootEntry = await import('./functions/index.ts');
 const sameHandler = rootEntry.onRequest === onRequest;
 console.log(`  ${sameHandler ? 'PASS' : 'FAIL'}  25. functions/index.ts points at the same handler`);
 pass = sameHandler && pass;
+
+// The hosts are hidden from /health but listed on the landing page, which needs
+// the token — that split is what keeps a typo checkable without leaking the list.
+const hosts = 'blog.example.com, localhost:5173';
+const pageWithHosts = await guardCall('/?token=obj-secret', null, { whitelist: hosts });
+const pageWithHostsText = await pageWithHosts.text();
+pass =
+  show('26. landing page lists the allowlist after login', pageWithHosts, 200) &&
+  pageWithHostsText.includes('blog.example.com') &&
+  pageWithHostsText.includes('localhost:5173') &&
+  pageWithHostsText.includes('hotlink: on (2 hosts)') &&
+  pass;
+
+const gateHidesHosts = await guardCall('/', null, { whitelist: hosts });
+const gateHidesHostsText = await gateHidesHosts.text();
+pass =
+  show('27. token prompt does not reveal the allowlist', gateHidesHosts, 401) &&
+  !gateHidesHostsText.includes('blog.example.com') &&
+  !gateHidesHostsText.includes('hotlink:') &&
+  pass;
 
 console.log();
 console.log(pass ? 'All passed' : 'Some assertions failed');

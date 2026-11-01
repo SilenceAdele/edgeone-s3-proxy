@@ -6,7 +6,7 @@
  * before functions, so a static index.html could never be token-gated.
  */
 
-const LANDING = String.raw`<!doctype html>
+const LANDING_HEAD = String.raw`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -34,7 +34,13 @@ const LANDING = String.raw`<!doctype html>
 
   <h2>Health check</h2>
   <pre><code>GET /health
--&gt; edgeone-s3-proxy OK</code></pre>
+-&gt; edgeone-s3-proxy OK
+   pages: protected | disabled (...)
+   hotlink: on (N hosts) | off
+   direct: token | closed | open</code></pre>
+  <p class="muted">This endpoint is public, so it reports the allowlist as a
+  count. The hosts themselves are listed under <em>Current configuration</em>
+  below, which only renders once you have entered the token.</p>
 
   <h2>Usage</h2>
   <pre><code>GET /&lt;object-key&gt;
@@ -61,11 +67,21 @@ IMG_REFERER_WHITELIST  optional, hosts allowed to embed objects</code></pre>
 
   <h2>Source</h2>
   <p><a href="https://github.com/SilenceAdele/edgeone-s3-proxy">github.com/SilenceAdele/edgeone-s3-proxy</a></p>
+`;
+
+const LANDING_TAIL = `
 </body>
 </html>
 `;
 
-export const pageFor = (path: string): string | null => (path === '/' ? LANDING : null);
+/**
+ * The landing page, with the effective access-control state appended. `/health`
+ * is public and only reports how many hosts are allowed; naming them here means
+ * verifying a typo needs the token, which is the point.
+ */
+export function landingPage(config: string): string {
+  return `${LANDING_HEAD}${config}${LANDING_TAIL}`;
+}
 
 const ESCAPES: Record<string, string> = {
   '&': '&amp;',
@@ -76,6 +92,26 @@ const ESCAPES: Record<string, string> = {
 };
 
 const esc = (value: string): string => value.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+
+/**
+ * The access-control block, rendered only after the token check passed.
+ * `direct` is how a request without a Referer is treated: token, closed or open.
+ */
+export function configBlock(hosts: string[], direct: string): string {
+  const rows = hosts.length
+    ? hosts.map((h) => `  ${esc(h)}`).join('\n')
+    : '  (empty: allowlist is off, every request is served)';
+  return `
+  <h2>Current configuration</h2>
+  <pre><code>hotlink: ${hosts.length ? `on (${hosts.length} hosts)` : 'off'}
+direct: ${esc(direct)}
+
+allowed Referer hosts:
+${rows}</code></pre>
+  <p class="muted">A request from one of these hosts is served without a token.
+  Any other <code>Referer</code> is refused, and a request without one needs the
+  token you just used.</p>`;
+}
 
 const GATE_STYLE = `
     *{box-sizing:border-box}

@@ -21,7 +21,7 @@
  * console under Project -> Settings -> Environment Variables.
  */
 
-import { disabledPage, gatePage, pageFor } from './_shared/pages.ts';
+import { configBlock, disabledPage, gatePage, landingPage } from './_shared/pages.ts';
 
 // ---------- Defaults (every one can be overridden by env) ----------
 const DEFAULT_REGION = 'cn-north-1';
@@ -67,24 +67,27 @@ async function handle(ctx: FnContext): Promise<Response> {
   const { request, env } = ctx;
 
   const refererWhitelist = parseWhitelist(env.IMG_REFERER_WHITELIST);
+  // How a request without a Referer (address bar, curl, RSS reader) is treated.
+  const directMode = refererWhitelist.length ? (env.PROXY_TOKEN ? 'token' : 'closed') : 'open';
 
   // ---- Health check (no credential required, proves the function is live) ----
   const url = new URL(request.url);
   if (url.pathname === '/health') {
-    // "direct" = a request with no Referer (address bar, curl, RSS reader).
-    const direct = refererWhitelist.length ? (env.PROXY_TOKEN ? 'token' : 'closed') : 'open';
+    // The allowlist is reported as a count only: this endpoint is public, and
+    // naming the hosts would tell an attacker which Referer to forge. The full
+    // list is on the token-gated landing page.
     return text(
       `edgeone-s3-proxy OK\n` +
         `pages: ${env.PROXY_TOKEN ? 'protected' : 'disabled (PROXY_TOKEN is not set)'}\n` +
-        `hotlink: ${refererWhitelist.length ? refererWhitelist.join(',') : 'off'}\n` +
-        `direct: ${direct}\n`,
+        `hotlink: ${refererWhitelist.length ? `on (${refererWhitelist.length} hosts)` : 'off'}\n` +
+        `direct: ${directMode}\n`,
       200,
     );
   }
 
   // The landing page requires PROXY_TOKEN. Object access control further below
   // is separate: a Referer allowlist, with the token as the direct-open fallback.
-  if (url.pathname === '/') return handlePage(ctx, url);
+  if (url.pathname === '/') return handlePage(ctx, url, refererWhitelist, directMode);
 
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return text('Method Not Allowed', 405);
@@ -254,7 +257,12 @@ async function handle(ctx: FnContext): Promise<Response> {
 }
 
 /** Serves "/"; requires PROXY_TOKEN to render. */
-async function handlePage(ctx: FnContext, url: URL): Promise<Response> {
+async function handlePage(
+  ctx: FnContext,
+  url: URL,
+  refererWhitelist: string[],
+  directMode: string,
+): Promise<Response> {
   const headers: Record<string, string> = {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
@@ -287,7 +295,10 @@ async function handlePage(ctx: FnContext, url: URL): Promise<Response> {
       `${ACCESS_COOKIE}=${expected}; Path=/; HttpOnly; Secure; SameSite=Lax; ` +
       `Max-Age=${ACCESS_COOKIE_TTL}`;
   }
-  return new Response(pageFor('/') || '', { status: 200, headers });
+  return new Response(landingPage(configBlock(refererWhitelist, directMode)), {
+    status: 200,
+    headers,
+  });
 }
 
 // ================= Pages Blob read-through cache =================

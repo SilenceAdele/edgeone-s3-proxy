@@ -64,7 +64,9 @@ S3 endpoint (Path-Style)
 1. Create a project on [EdgeOne Pages](https://console.cloud.tencent.com/edgeone/pages) and upload this repository
 2. **Project → Settings → Environment Variables** — configure the table below, including `PROXY_TOKEN` and `IMG_REFERER_WHITELIST`
 3. Point your domain at it (`img.example.com`)
-4. `GET /health` should answer `pages: protected`, the intended `hotlink:` list and `direct: token`; then open `/` and enter the token
+4. `GET /health` should answer `pages: protected`, `hotlink: on (3 hosts)` and
+   `direct: token`; then open `/`, enter the token, and the page lists which
+   three hosts are in effect
 
 ### Environment variables
 
@@ -102,9 +104,12 @@ not cover `/`.
   rendering, so a deployment cannot expose it by accident.
 - With the token set, an unknown visitor gets `401` and a token prompt. A
   successful login (`?token=`, the `x-proxy-token` header, or the 12-hour
-  `HttpOnly` cookie `proxy_access` holding `sha256(token)`) renders the page.
+  `HttpOnly` cookie `proxy_access` holding `sha256(token)`) renders the page
+  plus the access-control state currently in effect.
 - `/health` stays public: it returns `pages: protected` or
-  `pages: disabled (PROXY_TOKEN is not set)` as a deployment sentinel.
+  `pages: disabled (PROXY_TOKEN is not set)` as a deployment sentinel. It
+  reports the access-control *shape* only — the host list lives on the
+  token-gated page below.
 - **The token is shared with object access**: the same login cookie also
   authorises direct image opens, so logging in once at `/` covers both. See
   [Object access control](#object-access-control).
@@ -162,8 +167,12 @@ of an embedded widget is still the blog's host.
   every request, so it cannot break the blog by accident.
 - **Fails closed.** With a whitelist set but no `PROXY_TOKEN`, direct opens are
   `401`; there is no implicit bypass.
-- **`/health` reports the mode**: `hotlink: <list>` or `hotlink: off`, plus
-  `direct: token|closed|open`, so you can confirm the deployment at a glance.
+- **`/health` reports the shape, not the list**: `hotlink: on (N hosts)` or
+  `hotlink: off`, plus `direct: token|closed|open`. The endpoint is public, so
+  naming the hosts there would hand an attacker the `Referer` to forge.
+- **The list itself is on `/`, behind the token.** After login the landing page
+  appends the hosts in effect, which is where you check a typo — the same curl
+  that verifies `hotlink: on (3 hosts)` cannot tell you *which* three.
 - **Not authentication for the allowed host.** `Referer` is client-supplied, so
   `curl -e https://blog.example.com/ ...` still gets through. This stops other
   sites embedding your images, not someone who read this README.
@@ -267,11 +276,13 @@ PASS 17. token cookie also opens direct access         404  (expected 404)
 PASS 18. other sites stay blocked even with a token    403  (expected 403)
 PASS 19. empty whitelist disables the check            404  (expected 404)
 PASS 20. direct open fails closed without PROXY_TOKEN  401  (expected 401)
-PASS 21. health echoes the active whitelist            200  (expected 200)
+PASS 21. health reports the whitelist as a count       200  (expected 200)
 PASS 22. health reports hotlink: off                   200  (expected 200)
 SKIP 23. no key supplied (usage: node test.mjs <key>)
 PASS 24. Missing env vars -> clear error               500  (expected 500)
 PASS 25. functions/index.ts points at the same handler
+PASS 26. landing page lists the allowlist after login  200  (expected 200)
+PASS 27. token prompt does not reveal the allowlist    401  (expected 401)
 All passed
 ```
 
