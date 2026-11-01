@@ -12,6 +12,10 @@
  * assets return `EO-Cache-Status: Cache Hit`, function routes return no such
  * header). So a read-through cache is implemented on Pages Blob instead.
  *
+ * Hotlink protection is an optional Referer allowlist (IMG_REFERER_WHITELIST),
+ * checked before the cache so rejected requests never reach Blob or S3. Requests
+ * without a Referer (address bar, curl) must present PROXY_TOKEN instead.
+ *
  * IMPORTANT: all credentials are read from environment variables only.
  * Nothing sensitive is hardcoded. Configure them in the EdgeOne Pages
  * console under Project -> Settings -> Environment Variables.
@@ -62,17 +66,24 @@ export const onRequest = async (ctx: FnContext): Promise<Response> => {
 async function handle(ctx: FnContext): Promise<Response> {
   const { request, env } = ctx;
 
+  const refererWhitelist = parseWhitelist(env.IMG_REFERER_WHITELIST);
+
   // ---- Health check (no credential required, proves the function is live) ----
   const url = new URL(request.url);
   if (url.pathname === '/health') {
+    // "direct" = a request with no Referer (address bar, curl, RSS reader).
+    const direct = refererWhitelist.length ? (env.PROXY_TOKEN ? 'token' : 'closed') : 'open';
     return text(
-      `edgeone-s3-proxy OK\npages: ${env.PROXY_TOKEN ? 'protected' : 'disabled (PROXY_TOKEN is not set)'}\n`,
+      `edgeone-s3-proxy OK\n` +
+        `pages: ${env.PROXY_TOKEN ? 'protected' : 'disabled (PROXY_TOKEN is not set)'}\n` +
+        `hotlink: ${refererWhitelist.length ? refererWhitelist.join(',') : 'off'}\n` +
+        `direct: ${direct}\n`,
       200,
     );
   }
 
-  // The landing page requires PROXY_TOKEN; object URLs below stay public so the
-  // blog can keep embedding them with <img>.
+  // The landing page requires PROXY_TOKEN. Object access control further below
+  // is separate: a Referer allowlist, with the token as the direct-open fallback.
   if (url.pathname === '/') return handlePage(ctx, url);
 
   if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -123,9 +134,22 @@ async function handle(ctx: FnContext): Promise<Response> {
         `  ALLOWED_EXT            optional, default static/image files\n` +
         `  CACHE_TTL              optional, default ${DEFAULT_CACHE_TTL}\n` +
         `  BLOB_CACHE             optional, on|off, default on\n` +
-        `  BLOB_LIMIT_BYTES       optional, default ${DEFAULT_BLOB_LIMIT}\n`,
+        `  BLOB_LIMIT_BYTES       optional, default ${DEFAULT_BLOB_LIMIT}\n` +
+        `  IMG_REFERER_WHITELIST  optional, Referer hostnames; direct opens need PROXY_TOKEN\n`,
       500,
     );
+  }
+
+  // ---- Access control on objects (Referer allowlist + token for direct opens) ----
+  // Runs before Blob/S3 so a rejected request costs nothing upstream. An empty
+  // allowlist disables the whole check, so an unconfigured deployment never
+  // blocks anything.
+  if (refererWhitelist.length) {
+    const decision = refererDecision(request, refererWhitelist);
+    if (decision === 'block') return deny('Hotlinking is not allowed', 403);
+    if (decision === 'direct' && !(await objectTokenValid(ctx, url))) {
+      return deny('Token required', 401);
+    }
   }
 
   // ---- Resolve object key ----
@@ -412,7 +436,8 @@ function toHex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function sha256Hex(data: string): Promise<string> {
+/** Exported for tests: the cookie stores this hash, never the raw token. */
+export async function sha256Hex(data: string): Promise<string> {
   return toHex(await crypto.subtle.digest('SHA-256', enc.encode(data)));
 }
 
@@ -504,6 +529,61 @@ function isPlaceholder(v: string): boolean {
   return /REPLACE|your-|example|xxx|TODO|CHANGEME/i.test(v);
 }
 
+/**
+ * Comma-separated hostnames, optionally with port. A scheme or trailing path is
+ * tolerated and stripped so a pasted URL still works. Exported for tests.
+ */
+export function parseWhitelist(raw: string | undefined): string[] {
+  return (raw || '')
+    .split(',')
+    .map((h) =>
+      h
+        .trim()
+        .toLowerCase()
+        .replace(/^https?:\/\//, '')
+        .replace(/\/.*$/, ''),
+    )
+    .filter(Boolean);
+}
+
+/**
+ * Anti-hotlink only: a browser can forge Referer with `curl -e`, so this stops
+ * casual embedding, not a determined scraper. Exported for tests.
+ *
+ * - 'allow'  Referer host is whitelisted.
+ * - 'block'  Referer host is anything else: other sites are refused outright.
+ * - 'direct' No usable Referer (address bar, curl, RSS): needs the token. An
+ *            absent Referer is not an allow, or hotlink tools that omit it
+ *            would walk straight through.
+ */
+export function refererDecision(
+  request: Request,
+  whitelist: string[],
+): 'allow' | 'block' | 'direct' {
+  const referer = request.headers.get('referer') || '';
+  if (!referer) return 'direct';
+  let host = '';
+  try {
+    host = new URL(referer).host.toLowerCase();
+  } catch {
+    return 'direct'; // malformed header: treat as a direct open, never as trusted
+  }
+  return whitelist.includes(host) ? 'allow' : 'block';
+}
+
+/** Direct opens must present PROXY_TOKEN (query, header, or the page cookie). */
+async function objectTokenValid(ctx: FnContext, url: URL): Promise<boolean> {
+  const token = ctx.env.PROXY_TOKEN || '';
+  if (!token) return false; // fail closed: no token configured, no bypass
+  const provided =
+    url.searchParams.get('token') ||
+    ctx.request.headers.get('x-proxy-token') ||
+    readCookie(ctx.request, ACCESS_COOKIE) ||
+    '';
+  if (safeEqual(provided, token)) return true;
+  return safeEqual(provided, await sha256Hex(token));
+}
+
 function readCookie(request: Request, name: string): string {
   const header = request.headers.get('cookie') || '';
   for (const part of header.split(';')) {
@@ -531,5 +611,16 @@ function text(body: string, status: number): Response {
   return new Response(body, {
     status,
     headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+}
+
+/** Access-control rejections must never be cached by the browser. */
+function deny(body: string, status: number): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+    },
   });
 }

@@ -53,16 +53,18 @@ S3 endpoint (Path-Style)
 - **Signs exactly** `host;x-amz-content-sha256;x-amz-date`; `User-Agent` is set as an **unsigned** header
 - **Never sets the `Host` header** — the platform derives it from the URL; Host appears only in the canonical headers used for signing
 - **Three cache layers**: the EdgeOne CDN rule (`caches` in `edgeone.json`), EdgeOne's upstream cache (`eo.cacheEverything`), and the function-level `caches.default`. Default TTL is 7 days with `stale-while-revalidate=86400` so reloads feel instant.
-- **CORS open**, so any page can embed with `<img>`
+- **CORS open** (`access-control-allow-origin: *`) so an allowed page can also draw
+  the bytes on a canvas; what decides who may embed is the Referer check, not CORS
 - **Extension allowlist**, so the bucket is not exposed as a general file server
-- **Landing page gate**: `/` requires `PROXY_TOKEN`, while object URLs stay public
+- **Landing page gate**: `/` requires `PROXY_TOKEN`, and that token also unlocks direct object opens
+- **Object access control**: optional `IMG_REFERER_WHITELIST` serves only listed hosts; other sites get `403`, direct opens need `PROXY_TOKEN`
 
 ## Deployment
 
 1. Create a project on [EdgeOne Pages](https://console.cloud.tencent.com/edgeone/pages) and upload this repository
-2. **Project → Settings → Environment Variables** — configure the table below, including `PROXY_TOKEN`
+2. **Project → Settings → Environment Variables** — configure the table below, including `PROXY_TOKEN` and `IMG_REFERER_WHITELIST`
 3. Point your domain at it (`img.example.com`)
-4. `GET /health` should answer `pages: protected`; then open `/` and enter the token
+4. `GET /health` should answer `pages: protected`, the intended `hotlink:` list and `direct: token`; then open `/` and enter the token
 
 ### Environment variables
 
@@ -83,7 +85,8 @@ All credentials are read **from environment variables only**. No secret is hardc
 | `BLOB_LIMIT_BYTES` | no | Eviction ceiling. Default `838860800` (800 MB) — deliberately below the 1 GB free-tier cap. |
 | `BLOB_MAX_OBJECT_BYTES` | no | Objects larger than this stream through uncached. Default `5242880` (5 MB). |
 | `BLOB_MAX_ENTRIES` | no | Hard cap on cached objects. Default `2000`. |
-| `PROXY_TOKEN` | ✅ | Token protecting the landing page at `/`. Empty = `/` answers `503` (fail closed). Generate with `openssl rand -hex 24`. Object URLs are unaffected. |
+| `PROXY_TOKEN` | ✅ | Token protecting the landing page at `/`, and the fallback for object requests without a `Referer` when the whitelist is set. Empty = `/` answers `503` (fail closed). Generate with `openssl rand -hex 24`. |
+| `IMG_REFERER_WHITELIST` | no | Comma-separated Referer hostnames allowed to load objects; other hosts get `403`, and direct opens need `PROXY_TOKEN`. Empty = every request is served. See [Object access control](#object-access-control). |
 
 If anything is missing the function returns **500 and names the missing variables**, so you do not have to guess.
 
@@ -102,9 +105,65 @@ not cover `/`.
   `HttpOnly` cookie `proxy_access` holding `sha256(token)`) renders the page.
 - `/health` stays public: it returns `pages: protected` or
   `pages: disabled (PROXY_TOKEN is not set)` as a deployment sentinel.
-- **Object URLs are deliberately not gated.** `GET /<key>` keeps working with no
-  token, because the blog embeds images with `<img>`, which cannot send headers.
-  Gating them would break every image on the site.
+- **The token is shared with object access**: the same login cookie also
+  authorises direct image opens, so logging in once at `/` covers both. See
+  [Object access control](#object-access-control).
+
+### Object access control
+
+Set `IMG_REFERER_WHITELIST` and object URLs stop being open to the whole
+internet. The check runs before Blob and S3, so a rejected request costs nothing
+upstream:
+
+```
+IMG_REFERER_WHITELIST=blog.example.com,localhost:5173,127.0.0.1:5173
+```
+
+| Request | Result |
+|---|---|
+| `Referer` host is in the list | served — the blog, and nothing else, can embed |
+| `Referer` host is anything else | `403 Hotlinking is not allowed`, even with a token |
+| No `Referer` (address bar, `curl`, RSS reader) | needs `PROXY_TOKEN`; otherwise `401 Token required` |
+| Malformed `Referer` | treated as a direct open, so it needs the token too |
+| `IMG_REFERER_WHITELIST` empty | feature off — every request is served |
+
+A direct open accepts the token three ways, all the same `PROXY_TOKEN`:
+
+```bash
+curl "https://img.example.com/2026/10/a.jpg?token=$PROXY_TOKEN"   # query
+curl -H "x-proxy-token: $PROXY_TOKEN" https://img.example.com/...  # header
+```
+
+The third is the `proxy_access` cookie set when you log into `/`, so in a
+browser it is enough to open `/` and enter the token once — image links then
+work for 12 hours without touching the URL.
+
+Pick entries by asking who actually renders your images:
+
+| Entry | Who sends it |
+|---|---|
+| `blog.example.com` | The site that embeds the images — every `<img>` on a page sends this as its `Referer` |
+| `localhost:5173` | A local dev server opened as `http://localhost:5173/` |
+| `127.0.0.1:5173` | The same dev server opened as `http://127.0.0.1:5173/`; the browser treats it as a different host |
+
+Only list hosts that really serve pages. A bare apex domain and its `www.` are
+different hosts and both need an entry if both are live; a service that merely
+sits behind the blog (an API, a comment backend) does not, because the `Referer`
+of an embedded widget is still the blog's host.
+
+- **Hostnames only**, optionally with a port (`localhost:5173`). A pasted
+  `https://` prefix or trailing path is stripped, so both forms work.
+- **Matched exactly.** No wildcards and no subdomain matching, and the port is
+  part of the host.
+- **Empty means disabled.** A deployment without the variable keeps serving
+  every request, so it cannot break the blog by accident.
+- **Fails closed.** With a whitelist set but no `PROXY_TOKEN`, direct opens are
+  `401`; there is no implicit bypass.
+- **`/health` reports the mode**: `hotlink: <list>` or `hotlink: off`, plus
+  `direct: token|closed|open`, so you can confirm the deployment at a glance.
+- **Not authentication for the allowed host.** `Referer` is client-supplied, so
+  `curl -e https://blog.example.com/ ...` still gets through. This stops other
+  sites embedding your images, not someone who read this README.
 
 ## Blob read-through cache and the 1 GB ceiling
 
@@ -194,10 +253,28 @@ PASS  6. wrong token refused, never echoed             401  (expected 401)
 PASS  7. right token renders the landing page          200  (expected 200)
 PASS  8. the cookie opens the page                     200  (expected 200)
 PASS  9. health stays public and reports the gate      200  (expected 200)
-PASS 10. Fetch existing object image-bed/xxx.jpg       200  (expected 200)
-PASS 11. Missing env vars -> clear error               500  (expected 500)
+PASS 10. whitelist parsing (scheme/case/path/port)
+PASS 11. refererDecision 8 cases
+PASS 12. other sites blocked before S3 lookup          403  (expected 403)
+PASS 13. whitelisted Referer reaches upstream          404  (expected 404)
+PASS 14. direct open without token -> 401              401  (expected 401)
+PASS 15. wrong token refused, never echoed             401  (expected 401)
+PASS 16. direct open with the token reaches upstream   404  (expected 404)
+PASS 17. token cookie also opens direct access         404  (expected 404)
+PASS 18. other sites stay blocked even with a token    403  (expected 403)
+PASS 19. empty whitelist disables the check            404  (expected 404)
+PASS 20. direct open fails closed without PROXY_TOKEN  401  (expected 401)
+PASS 21. health echoes the active whitelist            200  (expected 200)
+PASS 22. health reports hotlink: off                   200  (expected 200)
+SKIP 23. no key supplied (usage: node test.mjs <key>)
+PASS 24. Missing env vars -> clear error               500  (expected 500)
+PASS 25. functions/index.ts points at the same handler
 All passed
 ```
+
+Tests 13, 16, 17 and 19 answer `404` rather than `200` because they request a key
+that does not exist: reaching upstream is the point, which proves the guard let
+them through.
 
 The test **calls `onRequest()` directly**, exercising the real code path, rather than re-implementing the signature separately — that avoids the two drifting apart.
 
@@ -205,17 +282,27 @@ The test **calls `onRequest()` directly**, exercising the real code path, rather
 
 - **Never** commit AccessKeys. `.env.example` in this repo lists variable names only, with no values.
 - A local `.env` used for debugging is excluded by `.gitignore`.
-- The proxy makes **every object that passes the extension allowlist** publicly readable. To expose only one directory, add a prefix check in `handle()`:
+- With no `IMG_REFERER_WHITELIST`, every object that passes the extension
+  allowlist is readable by anyone who has the URL. Set the allowlist to close
+  that off. Independently, to expose only one directory, add a prefix check in
+  `handle()`:
 
   ```ts
   if (!key.startsWith('public/')) return text('Not found', 404);
   ```
 
 - Prefer creating a **read-only AccessKey** just for this proxy instead of reusing a full-control key.
-- `PROXY_TOKEN` only hides the documentation page. It is **not** an access
-  control for objects: anyone holding an object URL can still fetch it, and that
-  is intentional (the blog's `<img>` tags cannot carry a token). Rotating the
-  token only invalidates existing `proxy_access` cookies.
+- `PROXY_TOKEN` gates the documentation page and direct object opens. It is
+  **not** required by the blog: whitelisted hosts load images with no token,
+  because `<img>` sends a `Referer` but cannot send headers. Rotating the token
+  invalidates existing `proxy_access` cookies and any `?token=` links.
+- `IMG_REFERER_WHITELIST` trusts a client-supplied header. `curl -e
+  https://blog.example.com/ ...` still gets through, so treat it as anti-hotlink,
+  not access control. To protect the content itself, keep the bucket private and
+  rotate the AccessKey instead.
+- A `?token=` URL is a bearer link: anyone who sees it can use it until the token
+  is rotated. Prefer the login cookie for browsing, and keep token URLs out of
+  public places.
 
 ## Known upstream issues (for troubleshooting)
 

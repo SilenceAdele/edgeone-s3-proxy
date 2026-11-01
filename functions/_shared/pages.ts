@@ -41,8 +41,11 @@ const LANDING = String.raw`<!doctype html>
 
 # example
 GET /2026/10/abcd1234ef56.png</code></pre>
-  <p class="muted">Object URLs stay public on purpose: the blog embeds them with
-  <code>&lt;img&gt;</code>. Only this page requires a token.</p>
+  <p class="muted">Access control is optional. With
+  <code>IMG_REFERER_WHITELIST</code> set, only those hosts are served (the blog
+  embeds images with <code>&lt;img&gt;</code>), other sites get 403, and a direct
+  open needs the same token you just entered. With it unset, object URLs are open
+  to anyone who has the URL.</p>
 
   <h2>Requirements</h2>
   <p>All credentials are read from environment variables. Configure them in the
@@ -53,7 +56,8 @@ S3_BUCKET
 S3_ENDPOINT            hostname only, no https://
 S3_REGION              optional, default cn-north-1
 UA_PREFIX              optional, default S3Drive
-PROXY_TOKEN            token for this page (required)</code></pre>
+PROXY_TOKEN            token for this page (required)
+IMG_REFERER_WHITELIST  optional, hosts allowed to embed objects</code></pre>
 
   <h2>Source</h2>
   <p><a href="https://github.com/SilenceAdele/edgeone-s3-proxy">github.com/SilenceAdele/edgeone-s3-proxy</a></p>
@@ -183,7 +187,7 @@ export function disabledPage(): string {
   <p class="lead">
     部署环境没有配置 <code>PROXY_TOKEN</code>，本页默认关闭。<br>
     在 EdgeOne 控制台的「环境变量」里加上它（可用 <code>openssl rand -hex 24</code> 生成），
-    重新部署后即可访问。图片地址不受影响。
+    重新部署后即可访问。博客页面里的图片不受影响；没有令牌时直接打开图片会被拒绝。
   </p>
 </div>
 </body>

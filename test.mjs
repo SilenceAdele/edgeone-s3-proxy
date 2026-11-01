@@ -13,7 +13,8 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 // Node 23+ strips TypeScript types natively.
-const { onRequest } = await import('./functions/[[...path]].ts');
+const mod = await import('./functions/[[...path]].ts');
+const { onRequest } = mod;
 
 const conf = {};
 for (const line of readFileSync(`${homedir()}/.config/imgup.conf`, 'utf8').split('\n')) {
@@ -112,9 +113,112 @@ pass =
   (await health.text()).includes('pages: protected') &&
   pass;
 
+// ---- Hotlink protection: pure helpers ----
+const parseSample = mod.parseWhitelist('https://Blog.Example.com/, blog2.example.com:8080 ,');
+const parseOk =
+  JSON.stringify(parseSample) === JSON.stringify(['blog.example.com', 'blog2.example.com:8080']) &&
+  mod.parseWhitelist('').length === 0 &&
+  mod.parseWhitelist(undefined).length === 0;
+console.log(`  ${parseOk ? 'PASS' : 'FAIL'}  10. whitelist parsing (scheme/case/path/port)`);
+pass = parseOk && pass;
+
+const list = ['blog.example.com', 'localhost:5173'];
+const refDecision = (referer) =>
+  mod.refererDecision(
+    new Request(BASE + '/a.png', { headers: referer === null ? {} : { referer } }),
+    list,
+  );
+const refCases = [
+  [null, 'direct', 'no Referer needs the token'],
+  ['https://blog.example.com/post/1', 'allow', 'whitelisted host'],
+  ['HTTPS://BLOG.EXAMPLE.COM/', 'allow', 'host is case-insensitive'],
+  ['https://evil.example.com/', 'block', 'other site'],
+  ['https://blog.example.com.evil.com/', 'block', 'suffix look-alike'],
+  ['https://localhost:5173/', 'allow', 'localhost with port'],
+  ['http://localhost/', 'block', 'localhost without port'],
+  ['not a url', 'direct', 'malformed Referer is not trusted'],
+];
+const refFails = refCases.filter(([ref, want]) => refDecision(ref) !== want);
+console.log(
+  `  ${refFails.length ? 'FAIL' : 'PASS'}  11. refererDecision ${refCases.length} cases` +
+    (refFails.length ? `  failed: ${refFails.map((c) => c[2]).join(', ')}` : ''),
+);
+pass = !refFails.length && pass;
+
+// ---- Object access control: end-to-end through handle() ----
+const guardCall = (path, referer, { whitelist = 'blog.example.com', token = 'obj-secret', headers = {} } = {}) =>
+  onRequest({
+    request: new Request(BASE + path, {
+      headers: {
+        ...(referer === null ? {} : { referer }),
+        ...headers,
+      },
+    }),
+    params: {},
+    env: { ...env, PROXY_TOKEN: token, IMG_REFERER_WHITELIST: whitelist },
+    waitUntil: () => {},
+  });
+
+const blocked = await guardCall('/no/such/file.png', 'https://evil.example.com/');
+pass = show('12. other sites blocked before S3 lookup', blocked, 403) && pass;
+
+const sameSite = await guardCall('/no/such/file.png', 'https://blog.example.com/post');
+pass = show('13. whitelisted Referer reaches upstream', sameSite, 404) && pass;
+
+const directNoToken = await guardCall('/no/such/file.png', null);
+pass =
+  show('14. direct open without token -> 401', directNoToken, 401) &&
+  (await directNoToken.text()).includes('Token required') &&
+  directNoToken.headers.get('cache-control') === 'no-store' &&
+  pass;
+
+const directWrong = await guardCall('/no/such/file.png?token=wrong', null);
+const wrongBody = await directWrong.text();
+pass =
+  show('15. wrong token refused, never echoed', directWrong, 401) &&
+  !wrongBody.includes('wrong') &&
+  pass;
+
+const directRight = await guardCall('/no/such/file.png?token=obj-secret', null);
+pass = show('16. direct open with the token reaches upstream', directRight, 404) && pass;
+
+const cookieHash = await mod.sha256Hex('obj-secret');
+const directCookie = await guardCall('/no/such/file.png', null, {
+  headers: { cookie: `proxy_access=${encodeURIComponent(cookieHash)}` },
+});
+pass = show('17. token cookie also opens direct access', directCookie, 404) && pass;
+
+const blockedWithToken = await guardCall(
+  '/no/such/file.png?token=obj-secret',
+  'https://evil.example.com/',
+);
+pass = show('18. other sites stay blocked even with a token', blockedWithToken, 403) && pass;
+
+const off = await guardCall('/no/such/file.png', 'https://evil.example.com/', { whitelist: '' });
+pass = show('19. empty whitelist disables the check', off, 404) && pass;
+
+const noTokenConfigured = await guardCall('/no/such/file.png', null, { token: '' });
+pass = show('20. direct open fails closed without PROXY_TOKEN', noTokenConfigured, 401) && pass;
+
+const healthHotlink = await guardCall('/health', null, {
+  whitelist: ' Blog.Example.com , www.example.com ',
+});
+const healthText = await healthHotlink.text();
+pass =
+  show('21. health echoes the active whitelist', healthHotlink, 200) &&
+  healthText.includes('hotlink: blog.example.com,www.example.com') &&
+  healthText.includes('direct: token') &&
+  pass;
+
+const healthOff = await guardCall('/health', null, { whitelist: '' });
+pass =
+  show('22. health reports hotlink: off', healthOff, 200) &&
+  (await healthOff.text()).includes('hotlink: off\n') &&
+  pass;
+
 if (KNOWN_KEY) {
   const r4 = await call('/' + KNOWN_KEY);
-  pass = show(`10. Fetch existing object ${KNOWN_KEY}`, r4, 200) && pass;
+  pass = show(`23. Fetch existing object ${KNOWN_KEY}`, r4, 200) && pass;
   if (r4.ok) {
     const ct = r4.headers.get('content-type');
     const len = (await r4.arrayBuffer()).byteLength;
@@ -122,7 +226,7 @@ if (KNOWN_KEY) {
     console.log(`        CORS: ${r4.headers.get('access-control-allow-origin')}`);
   }
 } else {
-  console.log('  SKIP 10. no key supplied (usage: node test.mjs <key>)');
+  console.log('  SKIP 23. no key supplied (usage: node test.mjs <key>)');
 }
 
 // Missing env vars must produce a clear, named error.
@@ -132,7 +236,7 @@ const r5 = await onRequest({
   env: { S3_BUCKET: 'b' },
   waitUntil: () => {},
 });
-pass = show('11. Missing env vars -> clear error', r5, 500) && pass;
+pass = show('24. Missing env vars -> clear error', r5, 500) && pass;
 if (r5.status === 500) {
   console.log(`        ${(await r5.text()).split('\n')[0]}`);
 }
@@ -140,7 +244,7 @@ if (r5.status === 500) {
 // The platform routes "/" to functions/index.ts only; keep that file wired up.
 const rootEntry = await import('./functions/index.ts');
 const sameHandler = rootEntry.onRequest === onRequest;
-console.log(`  ${sameHandler ? 'PASS' : 'FAIL'}  12. functions/index.ts points at the same handler`);
+console.log(`  ${sameHandler ? 'PASS' : 'FAIL'}  25. functions/index.ts points at the same handler`);
 pass = sameHandler && pass;
 
 console.log();
