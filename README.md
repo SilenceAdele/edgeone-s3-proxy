@@ -55,12 +55,14 @@ S3 endpoint (Path-Style)
 - **Three cache layers**: the EdgeOne CDN rule (`caches` in `edgeone.json`), EdgeOne's upstream cache (`eo.cacheEverything`), and the function-level `caches.default`. Default TTL is 7 days with `stale-while-revalidate=86400` so reloads feel instant.
 - **CORS open**, so any page can embed with `<img>`
 - **Extension allowlist**, so the bucket is not exposed as a general file server
+- **Landing page gate**: `/` requires `PROXY_TOKEN`, while object URLs stay public
 
 ## Deployment
 
 1. Create a project on [EdgeOne Pages](https://console.cloud.tencent.com/edgeone/pages) and upload this repository
-2. **Project → Settings → Environment Variables** — configure the table below
+2. **Project → Settings → Environment Variables** — configure the table below, including `PROXY_TOKEN`
 3. Point your domain at it (`img.example.com`)
+4. `GET /health` should answer `pages: protected`; then open `/` and enter the token
 
 ### Environment variables
 
@@ -81,8 +83,28 @@ All credentials are read **from environment variables only**. No secret is hardc
 | `BLOB_LIMIT_BYTES` | no | Eviction ceiling. Default `838860800` (800 MB) — deliberately below the 1 GB free-tier cap. |
 | `BLOB_MAX_OBJECT_BYTES` | no | Objects larger than this stream through uncached. Default `5242880` (5 MB). |
 | `BLOB_MAX_ENTRIES` | no | Hard cap on cached objects. Default `2000`. |
+| `PROXY_TOKEN` | ✅ | Token protecting the landing page at `/`. Empty = `/` answers `503` (fail closed). Generate with `openssl rand -hex 24`. Object URLs are unaffected. |
 
 If anything is missing the function returns **500 and names the missing variables**, so you do not have to guess.
+
+### Landing page gate
+
+`/` is the documentation page. It lives in `functions/_shared/pages.ts` rather
+than `public/`, because EdgeOne serves static files before functions and a static
+`index.html` could never be token-gated. `functions/index.ts` re-exports the
+handler because EdgeOne maps only `index.ts` to the root path; a catch-all does
+not cover `/`.
+
+- Without `PROXY_TOKEN` the page answers `503` with a setup notice instead of
+  rendering, so a deployment cannot expose it by accident.
+- With the token set, an unknown visitor gets `401` and a token prompt. A
+  successful login (`?token=`, the `x-proxy-token` header, or the 12-hour
+  `HttpOnly` cookie `proxy_access` holding `sha256(token)`) renders the page.
+- `/health` stays public: it returns `pages: protected` or
+  `pages: disabled (PROXY_TOKEN is not set)` as a deployment sentinel.
+- **Object URLs are deliberately not gated.** `GET /<key>` keeps working with no
+  token, because the blog embeds images with `<img>`, which cannot send headers.
+  Gating them would break every image on the site.
 
 ## Blob read-through cache and the 1 GB ceiling
 
@@ -163,13 +185,18 @@ node test-blob.mjs
 Expected output:
 
 ```
-✅ ① Health check /                                   200
-✅ ② No extension / disallowed type                    403
-✅ ③ Valid signature, object missing                   404
-✅ ④ Fetch existing object image-bed/xxx.jpg           200
-     content-type=image/jpeg  size=3638867B  CORS: *
-✅ ⑤ Missing env vars -> clear error                    500
-✅ All passed
+PASS  1. Health check /health                          200  (expected 200)
+PASS  2. No extension / disallowed type                403  (expected 403)
+PASS  3. Valid signature, object missing               404  (expected 404)
+PASS  4. " / " without PROXY_TOKEN -> 503              503  (expected 503)
+PASS  5. " / " asks for the token                      401  (expected 401)
+PASS  6. wrong token refused, never echoed             401  (expected 401)
+PASS  7. right token renders the landing page          200  (expected 200)
+PASS  8. the cookie opens the page                     200  (expected 200)
+PASS  9. health stays public and reports the gate      200  (expected 200)
+PASS 10. Fetch existing object image-bed/xxx.jpg       200  (expected 200)
+PASS 11. Missing env vars -> clear error               500  (expected 500)
+All passed
 ```
 
 The test **calls `onRequest()` directly**, exercising the real code path, rather than re-implementing the signature separately — that avoids the two drifting apart.
@@ -185,6 +212,10 @@ The test **calls `onRequest()` directly**, exercising the real code path, rather
   ```
 
 - Prefer creating a **read-only AccessKey** just for this proxy instead of reusing a full-control key.
+- `PROXY_TOKEN` only hides the documentation page. It is **not** an access
+  control for objects: anyone holding an object URL can still fetch it, and that
+  is intentional (the blog's `<img>` tags cannot carry a token). Rotating the
+  token only invalidates existing `proxy_access` cookies.
 
 ## Known upstream issues (for troubleshooting)
 

@@ -17,6 +17,8 @@
  * console under Project -> Settings -> Environment Variables.
  */
 
+import { disabledPage, gatePage, pageFor } from './_shared/pages.ts';
+
 // ---------- Defaults (every one can be overridden by env) ----------
 const DEFAULT_REGION = 'cn-north-1';
 const DEFAULT_UA_PREFIX = 'S3Drive';
@@ -34,6 +36,9 @@ const DEFAULT_BLOB_LIMIT = 800 * 1024 * 1024; // 800 MB
 const DEFAULT_BLOB_MAX_OBJECT = 5 * 1024 * 1024; // 5 MB
 const DEFAULT_BLOB_MAX_ENTRIES = 2000;
 const INDEX_KEY = '__index__';
+
+const ACCESS_COOKIE = 'proxy_access';
+const ACCESS_COOKIE_TTL = 12 * 60 * 60;
 
 /** EdgeOne Edge Function context (hand-written to avoid a type dependency). */
 interface FnContext {
@@ -59,9 +64,16 @@ async function handle(ctx: FnContext): Promise<Response> {
 
   // ---- Health check (no credential required, proves the function is live) ----
   const url = new URL(request.url);
-  if (url.pathname === '/' || url.pathname === '/health') {
-    return text('edgeone-s3-proxy OK\n', 200);
+  if (url.pathname === '/health') {
+    return text(
+      `edgeone-s3-proxy OK\npages: ${env.PROXY_TOKEN ? 'protected' : 'disabled (PROXY_TOKEN is not set)'}\n`,
+      200,
+    );
   }
+
+  // The landing page requires PROXY_TOKEN; object URLs below stay public so the
+  // blog can keep embedding them with <img>.
+  if (url.pathname === '/') return handlePage(ctx, url);
 
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return text('Method Not Allowed', 405);
@@ -214,6 +226,43 @@ async function handle(ctx: FnContext): Promise<Response> {
   }
 
   return out;
+}
+
+/** Serves "/"; requires PROXY_TOKEN to render. */
+async function handlePage(ctx: FnContext, url: URL): Promise<Response> {
+  const headers: Record<string, string> = {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+    'x-robots-tag': 'noindex, nofollow',
+  };
+  const method = ctx.request.method.toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return text('Method Not Allowed', 405);
+
+  const token = ctx.env.PROXY_TOKEN || '';
+  if (method === 'HEAD') return new Response(null, { status: token ? 200 : 503, headers });
+  if (!token) return new Response(disabledPage(), { status: 503, headers });
+
+  const provided =
+    ctx.request.headers.get('x-proxy-token') ||
+    url.searchParams.get('token') ||
+    readCookie(ctx.request, ACCESS_COOKIE) ||
+    '';
+  const expected = await sha256Hex(token);
+  if (!safeEqual(provided, token) && !safeEqual(provided, expected)) {
+    return new Response(gatePage('/', provided ? '令牌不正确，请重试。' : ''), {
+      status: 401,
+      headers,
+    });
+  }
+
+  // Remember the login as a hash, so the raw token does not sit in the browser.
+  if (!safeEqual(readCookie(ctx.request, ACCESS_COOKIE), expected)) {
+    headers['set-cookie'] =
+      `${ACCESS_COOKIE}=${expected}; Path=/; HttpOnly; Secure; SameSite=Lax; ` +
+      `Max-Age=${ACCESS_COOKIE_TTL}`;
+  }
+  return new Response(pageFor('/') || '', { status: 200, headers });
 }
 
 // ================= Pages Blob read-through cache =================
@@ -453,6 +502,29 @@ async function signRequest(opts: {
 
 function isPlaceholder(v: string): boolean {
   return /REPLACE|your-|example|xxx|TODO|CHANGEME/i.test(v);
+}
+
+function readCookie(request: Request, name: string): string {
+  const header = request.headers.get('cookie') || '';
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) {
+      try {
+        return decodeURIComponent(part.slice(eq + 1).trim());
+      } catch {
+        return '';
+      }
+    }
+  }
+  return '';
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 function text(body: string, status: number): Response {

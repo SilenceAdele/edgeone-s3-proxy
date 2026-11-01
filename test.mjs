@@ -53,13 +53,68 @@ console.log(`bucket: ${env.S3_BUCKET}   endpoint: ${env.S3_ENDPOINT}\n`);
 
 let pass = true;
 
-pass = show('1. Health check /', await call('/'), 200) && pass;
+pass = show('1. Health check /health', await call('/health'), 200) && pass;
 pass = show('2. No extension / disallowed type', await call('/etc/passwd'), 403) && pass;
 pass = show('3. Valid signature, object missing', await call('/no/such/file.png'), 404) && pass;
 
+// The landing page fails closed without PROXY_TOKEN, then asks for it.
+const page = (path, { tokenEnv = '', headers = {} } = {}) =>
+  onRequest({
+    request: new Request(BASE + path, { method: 'GET', headers }),
+    params: {},
+    env: { ...env, PROXY_TOKEN: tokenEnv },
+    waitUntil: () => {},
+  });
+
+const noToken = await page('/');
+const noTokenText = await noToken.text();
+pass =
+  show('4. " / " without PROXY_TOKEN -> 503', noToken, 503) &&
+  !noTokenText.includes('S3 reverse proxy') &&
+  pass;
+
+const gated = await page('/', { tokenEnv: 'page-secret' });
+const gatedText = await gated.text();
+pass =
+  show('5. " / " asks for the token', gated, 401) &&
+  gatedText.includes('name="token"') &&
+  pass;
+
+const wrong = await page('/?token=nope', { tokenEnv: 'page-secret' });
+const wrongText = await wrong.text();
+pass =
+  show('6. wrong token refused, never echoed', wrong, 401) &&
+  wrongText.includes('令牌不正确') &&
+  !wrongText.includes('nope') &&
+  pass;
+
+const good = await page('/?token=page-secret', { tokenEnv: 'page-secret' });
+const goodText = await good.text();
+const cookie = good.headers.get('set-cookie') || '';
+pass =
+  show('7. right token renders the landing page', good, 200) &&
+  goodText.includes('S3 reverse proxy') &&
+  /proxy_access=/.test(cookie) &&
+  /HttpOnly/.test(cookie) &&
+  !cookie.includes('page-secret') &&
+  pass;
+
+const cookieValue = /proxy_access=([^;]+)/.exec(cookie)?.[1] || '';
+const byCookie = await page('/', {
+  tokenEnv: 'page-secret',
+  headers: { cookie: `proxy_access=${cookieValue}` },
+});
+pass = show('8. the cookie opens the page', byCookie, 200) && pass;
+
+const health = await page('/health', { tokenEnv: 'page-secret' });
+pass =
+  show('9. health stays public and reports the gate', health, 200) &&
+  (await health.text()).includes('pages: protected') &&
+  pass;
+
 if (KNOWN_KEY) {
   const r4 = await call('/' + KNOWN_KEY);
-  pass = show(`4. Fetch existing object ${KNOWN_KEY}`, r4, 200) && pass;
+  pass = show(`10. Fetch existing object ${KNOWN_KEY}`, r4, 200) && pass;
   if (r4.ok) {
     const ct = r4.headers.get('content-type');
     const len = (await r4.arrayBuffer()).byteLength;
@@ -67,7 +122,7 @@ if (KNOWN_KEY) {
     console.log(`        CORS: ${r4.headers.get('access-control-allow-origin')}`);
   }
 } else {
-  console.log('  SKIP  4. no key supplied (usage: node test.mjs <key>)');
+  console.log('  SKIP 10. no key supplied (usage: node test.mjs <key>)');
 }
 
 // Missing env vars must produce a clear, named error.
@@ -77,10 +132,16 @@ const r5 = await onRequest({
   env: { S3_BUCKET: 'b' },
   waitUntil: () => {},
 });
-pass = show('5. Missing env vars -> clear error', r5, 500) && pass;
+pass = show('11. Missing env vars -> clear error', r5, 500) && pass;
 if (r5.status === 500) {
   console.log(`        ${(await r5.text()).split('\n')[0]}`);
 }
+
+// The platform routes "/" to functions/index.ts only; keep that file wired up.
+const rootEntry = await import('./functions/index.ts');
+const sameHandler = rootEntry.onRequest === onRequest;
+console.log(`  ${sameHandler ? 'PASS' : 'FAIL'}  12. functions/index.ts points at the same handler`);
+pass = sameHandler && pass;
 
 console.log();
 console.log(pass ? 'All passed' : 'Some assertions failed');
